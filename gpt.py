@@ -1,17 +1,18 @@
 import torch 
 from src.layers import GPTLanguageModel
+import tiktoken
 
 # set hyperparameters
-batch_size = 64 # number of independent sequences in a batch
-block_size = 512 # maximum context lenght
+batch_size = 32 # number of independent sequences in a batch
+block_size = 256 # maximum context lenght
 max_iters = 10000
 eval_interval = 500
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embed = 32
-n_head = 12
-n_layer = 12
+n_head = 6
+n_layer = 6
 dropout = 0.2
 # ------------
 torch.manual_seed(42)
@@ -21,17 +22,20 @@ with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 # unique caracteres
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
+# chars = sorted(list(set(text)))
+# vocab_size = len(chars)
+enc = tiktoken.get_encoding("gpt2")
+vocab_size = enc.n_vocab
 
 # create mapping caracteres to integers and vice versa
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
-encode = lambda s: [stoi[c] for c in s] # take a string, output a list of integers
-decode = lambda l: ''.join([itos[i] for i in l]) # take a list of integers, output a string
+# stoi = {ch: i for i, ch in enumerate(chars)}
+# itos = {i: ch for i, ch in enumerate(chars)}
+# encode = lambda s: [stoi[c] for c in s] # take a string, output a list of integers
+# decode = lambda l: ''.join([itos[i] for i in l]) # take a list of integers, output a string
 
 # train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
+#data = torch.tensor(encode(text), dtype=torch.long)
+data = torch.tensor(enc.encode(text), dtype=torch.long)
 n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
@@ -87,5 +91,5 @@ for iter in range(max_iters):
     opt.step()
 
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, 1000)[0].tolist()))
-open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+print(enc.decode(m.generate(context, 1000)[0].tolist()))
+open('more2.txt', 'w').write(enc.decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
