@@ -198,7 +198,7 @@ class DataLoaderLite:
         # tokenize data
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens, dtype=torch.long)
+        self.tokens = torch.tensor(tokens)
 
         print(f"loaded: {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
@@ -234,9 +234,12 @@ if torch.cuda.is_available():
 
 train_loader = DataLoaderLite(B=2, T=1024)
 
+torch.set_float32_matmul_precision('high')
+
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
+model = torch.compile(model)
 
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -245,7 +248,8 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize()
@@ -259,7 +263,7 @@ import sys; sys.exit(0)
 # prefix tokens
 
 tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = torch.tensor(tokens) # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
 x = tokens.to(device)
 
