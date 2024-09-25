@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import inspect
+import os
 
 # -------------------------------------------------
 
@@ -210,25 +211,38 @@ class GPT(nn.Module):
         return optimizer
 
 # -------------------------------------------------
-import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, split):
         self.B = B
         self.T = T
 
-        # read data
-        with open('./../input.txt', 'r') as f:
-            text = f.read()
-        # tokenize data
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
+        assert split in {'train', 'val'}
 
-        print(f"loaded: {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
 
-        self.current_position = 0
+        assert len(self.shards) > 0, f"no shards found for split: {split}"
+        print(f"found {len(self.shards)} shards for split: {split}")
+
+        self.reset()
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -239,8 +253,10 @@ class DataLoaderLite:
         # advance position in the tensor
         self.current_position += B*T
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + B*T >= len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens()
+            self.current_position = B * T 
         return x, y
 
 # -------------------------------------------------
@@ -265,7 +281,8 @@ grad_accum_steps = total_batch_size // (B*T)
 print(f"total desired batch size: {total_batch_size}")
 print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T)
+train_loader = DataLoaderLite(B=B, T=T, split='train')
+val_loader = DataLoaderLite(B=B, T=T, split='val')
 
 torch.set_float32_matmul_precision('high')
 
@@ -276,8 +293,8 @@ model = torch.compile(model)
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
 
 def get_lr(it):
     # 1) linear warmup 
@@ -297,10 +314,29 @@ def get_lr(it):
 #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
-for step in range(50):
+for step in range(max_steps):
     t0 = time.time()
-    optimizer.zero_grad()
 
+    # once in a while evaluate the model
+    if step % 250 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.item()
+        print(f"validation loss: {val_loss_accum.item():.4f}")
+
+
+    # training loop
+    model.train()
+    optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
@@ -326,39 +362,3 @@ for step in range(50):
     dt = (t1 - t0)*1000
     tokens_per_second = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
     print(f"step {step:4d} | loss = {loss_accum.item():.6f} | norm = {norm:.4f} | dt = {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
-
-import sys; sys.exit(0)
-
-# prefix tokens
-
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to(device)
-
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x)
-        # take the logits at the last position
-        logits = logits[:, -1, :]
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1) # (5, vocab_size)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50) topk_indices becomes (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append the sequence
-        x = torch.cat((x, xcol), dim=1)
-
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
