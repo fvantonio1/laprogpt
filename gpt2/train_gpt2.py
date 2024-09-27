@@ -214,6 +214,7 @@ import numpy as np
 
 def load_tokens(filename):
     npt = np.load(filename)
+    npt = npt.astype(np.uint16)
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
 
@@ -282,7 +283,7 @@ def get_most_likely_row(tokens, mask, logits):
     return pred_norm
 
 # -------------------------------------------------
-
+import tiktoken
 import time
 
 # detect device
@@ -295,6 +296,8 @@ seed = 1337
 torch.manual_seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(seed)
+
+enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2^19
 B = 4
@@ -312,7 +315,7 @@ torch.set_float32_matmul_precision('high')
 # get logits
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-use_compile = True
+use_compile = False
 if use_compile:
     model = torch.compile(model)
 
@@ -348,7 +351,7 @@ for step in range(max_steps):
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate the model
-    if step % 250 == 0:
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -361,29 +364,30 @@ for step in range(max_steps):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
-        print(f"validation loss: {val_loss_accum.item():.4f}")
 
-        with open(log_file, 'a') as f:
-            f.write(f"step {step} val {val_loss_accum.item():.4f}\n")
-        
-        if step > 0 and (step % 5000 == 0 or last_step):
-            # write model checkpoints
-            checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-            checkpoint = {
-                'model': model.state_dict(),
-                'config': model.config,
-                'step': step,
-                'val_loss': val_loss_accum.item()
-            }
-            # you might also want to add optimizer.state_dict() and
-            # rng seeds etc., if you wanted to more exactly resume training
-            torch.save(checkpoint, checkpoint_path)
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+            with open(log_file, 'a') as f:
+                f.write(f"step {step} val {val_loss_accum.item():.4f}\n")
+            
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'config': model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                # you might also want to add optimizer.state_dict() and
+                # rng seeds etc., if you wanted to more exactly resume training
+                torch.save(checkpoint, checkpoint_path)
 
     # once in a while evaluate hellaswag
     if (step % 250 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
-        for i, example in enumerate(iterate_examples["val"]):
+        for i, example in enumerate(iterate_examples("val")):
             _, tokens, mask, label = render_example(example)
             tokens = tokens.to(device)
             mask = mask.to(device)
@@ -400,6 +404,41 @@ for step in range(max_steps):
         with open(log_file, 'a') as f:
             f.write("f{step} hella {acc_norm:.4f}\n")
 
+    # once in a while generate from model (except step 0, which is noise)
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(xgen)
+                # take logits at the last position
+                logits = logits[:, -1, :]
+                # get probs
+                probs = F.softmax(logits, dim=-1)
+                # do top k sampling of 50
+                # topk_probs here becomes (5, 50) and topk_indices becomes (5, 50)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                # select a token from the top-k probabilities
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                # append to the sequence
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"generated {i}: {decoded}")
 
     # training loop
     model.train()
