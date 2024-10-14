@@ -32,6 +32,18 @@ def get_most_likely_row(tokens, mask, logits):
 # -------------------------------------------------
 import tiktoken
 import time
+from argparse import ArgumentParser
+
+parser = ArgumentParser()
+parser.add_argument('--from_checkpoint', type=str, default=None)
+parser.add_argument('--from_pretrained', type=str, default=None)
+
+args = parser.parse_args()
+
+if args.from_checkpoint:
+    checkpoint = torch.load(args.from_checkpoint)
+else:
+    checkpoint = None
 
 # detect device
 device = 'cpu'
@@ -60,8 +72,21 @@ val_loader = DataLoaderLite(B=B, T=T, split='val')
 torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig(vocab_size=50304))
+if checkpoint:
+    model = GPT(checkpoint['config'])
+    model.load_state_dict(checkpoint['model'])
+    print(f"loaded checkpoint from {args.from_checkpoint}")
+    print(f"=> checkpoint validation loss: {checkpoint['val_loss']}")
+
+else:  
+    if args.from_pretrained:
+        model = GPT.from_pretrained(args.from_pretrained)
+        print(f"loaded pretrained GPT2 model {args.from_pretrained}")
+
+    model = GPT(GPTConfig(vocab_size=50304))
+
 model.to(device)
+
 use_compile = False
 if use_compile:
     model = torch.compile(model)
@@ -87,13 +112,28 @@ def get_lr(it):
 
 # optimize!
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+# load optimizer state dict if loading checkpoint
+if checkpoint:
+    optimizer.load_state_dict(checkpoint['optimizer'])
+
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "log.txt")
-with open(log_file, 'w') as f:
-    pass
 
-for step in range(max_steps):
+# create log file if not loading checkpoint
+if not checkpoint:
+    with open(log_file, 'w') as f:
+        pass
+    initial_step = 0
+
+# restore current step if loading checkpoint
+else:
+    initial_step = checkpoint['step']
+    for _ in range(initial_step):
+        for micro_step in range(grad_accum_steps):
+            train_loader.next_batch()
+
+for step in range(initial_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
@@ -124,7 +164,8 @@ for step in range(max_steps):
                     'model': model.state_dict(),
                     'config': model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum.item(),
+                    'optimizer': optimizer.state_dict(),
                 }
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
