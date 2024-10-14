@@ -83,7 +83,8 @@ else:
         model = GPT.from_pretrained(args.from_pretrained)
         print(f"loaded pretrained GPT2 model {args.from_pretrained}")
 
-    model = GPT(GPTConfig(vocab_size=50304))
+    else:
+        model = GPT(GPTConfig(vocab_size=50304))
 
 model.to(device)
 
